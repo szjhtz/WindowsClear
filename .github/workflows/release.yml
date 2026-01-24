@@ -1,0 +1,46 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Init Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+        
+    - name: Build Release
+      run: cargo build --release --verbose
+      
+    - name: Rename Executable
+      run: |
+        cd target/release
+        Move-Item cpan_mover.exe WindowsClear.exe
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: WindowsClear
+        path: target/release/WindowsClear.exe
+        
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: target/release/WindowsClear.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
