@@ -46,6 +46,12 @@ cd WindowsClear
 # 编译 Release 版本
 cargo build --release
 ```
+## 打赏
+### 爱发电
+https://afdian.com/a/anyone168
+
+### USDT-TRC20
+`TREQQPsEVBMH6SqboRoVYh5Hk7fMSCGkAx`
 
 ## License
 MIT License
