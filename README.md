@@ -1,8 +1,24 @@
 # WindowsClear (AppData Mover)
-
-[中文](README.md) | [English](README_EN.md)
-
 ![Screenshot](img1.png)
+<p align="center">
+   
+<p align="center">
+  [<a href="https://github.com/tanaer/WindowsClear/releases">立即体验</a>] [<a href="./docs/README_EN.md">English</a>]
+</p>
+<p align="center">
+  <a href="https://t.me/+Gs3SH2qAPeFhYmU9">
+    <img alt="Telegram" src="https://img.shields.io/badge/Telegram-%235AA9E6?logo=telegram&labelColor=FFFFFF" />
+  </a>
+  <a href="https://deepwiki.com/tanaer/WindowsClear">
+    <img alt="DeepWiki" src="https://deepwiki.com/badge.svg" />
+  </a>
+  <br>
+  <img alt="GitHub commits since latest release" src="https://img.shields.io/github/commits-since/tanaer/WindowsClear/latest">
+  <a href="https://github.com/tanaer/WindowsClear/releases">
+    <img alt="GitHub Release" src="https://img.shields.io/github/v/release/tanaer/WindowsClear">
+  </a>
+</p>
+
 
 ## 简介
 
