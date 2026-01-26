@@ -97,9 +97,6 @@ https://afdian.com/a/anyone168
 
 MIT License
 
-### USDT-TRC20
-`TREQQPsEVBMH6SqboRoVYh5Hk7fMSCGkAx`
-
 ## 🚀 Activity
 
 [![Star History Chart](https://api.star-history.com/svg?repos=tanaer/WindowsClear&type=date&legend=top-left)](https://www.star-history.com/#tanaer/WindowsClear&type=date&legend=top-left)
