@@ -6,15 +6,15 @@
   [<a href="https://github.com/tanaer/WindowsClear/releases">立即体验</a>] [<a href="./docs/README_EN.md">English</a>]
 </p>
 <p align="center">
-  <a href="https://t.me/+Gs3SH2qAPeFhYmU9">
+  <a href="https://t.me/TgTechMsgBot" target="_blank">
     <img alt="Telegram" src="https://img.shields.io/badge/Telegram-%235AA9E6?logo=telegram&labelColor=FFFFFF" />
   </a>
-  <a href="https://deepwiki.com/tanaer/WindowsClear">
+  <a href="https://deepwiki.com/tanaer/WindowsClear" target="_blank">
     <img alt="DeepWiki" src="https://deepwiki.com/badge.svg" />
   </a>
   <br>
   <img alt="GitHub commits since latest release" src="https://img.shields.io/github/commits-since/tanaer/WindowsClear/latest">
-  <a href="https://github.com/tanaer/WindowsClear/releases">
+  <a href="https://github.com/tanaer/WindowsClear/releases" target="_blank">
     <img alt="GitHub Release" src="https://img.shields.io/github/v/release/tanaer/WindowsClear">
   </a>
 </p>
