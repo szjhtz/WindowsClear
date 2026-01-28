@@ -1,25 +1,21 @@
+use crate::core::config::ScanSource;
 use anyhow::Result;
 use directories::ProjectDirs;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use walkdir::WalkDir;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AppDataCategory {
-    Local,
-    Roaming,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
     pub path: PathBuf,
     pub name: String,
     pub size_bytes: u64,
-    pub category: AppDataCategory,
+    pub label: String,
+    pub target_subdir: String,
     pub parent_total_size: u64,
 }
 
@@ -35,15 +31,14 @@ struct CacheEntry {
 struct ScanCache {
     version: u32,
     created_at: u64,
-    local_root: PathBuf,
-    roaming_root: PathBuf,
+    roots: Vec<PathBuf>,
     entries: Vec<CacheEntry>,
 }
 
 pub struct Scanner;
 
 impl Scanner {
-    const CACHE_VERSION: u32 = 2;
+    const CACHE_VERSION: u32 = 3;
     const CACHE_TTL_SECS: u64 = 10 * 60;
 
     /// 获取目录最后修改时间（取本身元数据）
@@ -88,15 +83,14 @@ impl Scanner {
     }
 
     /// 保存缓存
-    fn save_cache(local_root: &Path, roaming_root: &Path, all_entries: Vec<CacheEntry>) {
+    fn save_cache(roots: Vec<PathBuf>, all_entries: Vec<CacheEntry>) {
         let Some(cache_path) = Self::cache_path() else {
             return;
         };
         let cache = ScanCache {
             version: Self::CACHE_VERSION,
             created_at: Self::now_secs(),
-            local_root: local_root.to_path_buf(),
-            roaming_root: roaming_root.to_path_buf(),
+            roots,
             entries: all_entries,
         };
         if let Ok(content) = serde_json::to_string(&cache) {
@@ -127,34 +121,39 @@ impl Scanner {
     /// 扫描并返回占用超过 10% 的文件夹
     ///
     /// `progress_cb`: 回调函数，参数为 (已完成数量, 总数量, 当前正在处理的文件夹名称)
-    pub fn scan_large_folders<F>(progress_cb: F) -> Result<Vec<ScanResult>>
+    pub fn scan_large_folders<F>(
+        scan_sources: &[ScanSource],
+        progress_cb: F,
+    ) -> Result<Vec<ScanResult>>
     where
         F: Fn(usize, usize, String) + Sync + Send + Clone,
     {
-        let local_appdata = std::env::var("LOCALAPPDATA").map(PathBuf::from)?;
-        let appdata = std::env::var("APPDATA").map(PathBuf::from)?; // Roaming
-        let local_root = local_appdata.clone();
-        let roaming_root = appdata.clone();
-
         let mut results = Vec::new();
 
         // 1. 收集所有一级子目录，以便计算总任务数
         let mut all_targets = Vec::new();
 
-        for (root, category) in [
-            (local_root.clone(), AppDataCategory::Local),
-            (roaming_root.clone(), AppDataCategory::Roaming),
-        ] {
+        let active_sources: Vec<ScanSource> =
+            scan_sources.iter().filter(|s| s.enabled).cloned().collect();
+        let roots: Vec<PathBuf> = active_sources.iter().map(|s| s.path.clone()).collect();
+
+        for src in &active_sources {
+            let root = &src.path;
             if !root.exists() {
                 continue;
             }
-            if let Ok(entries) = std::fs::read_dir(&root) {
+            if let Ok(entries) = std::fs::read_dir(root) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
                         // 过滤掉已经是软链接的文件夹
                         if !Self::is_symlink_or_junction(&path) {
-                            all_targets.push((path, category.clone(), root.clone()));
+                            all_targets.push((
+                                path,
+                                src.label.clone(),
+                                src.target_subdir.clone(),
+                                root.clone(),
+                            ));
                         }
                     }
                 }
@@ -169,8 +168,7 @@ impl Scanner {
         let (cache_map, cache_is_fresh): (std::collections::HashMap<PathBuf, (u64, u64)>, bool) =
             if let Some(cache) = Self::load_cache() {
                 let fresh = cache.created_at.saturating_add(Self::CACHE_TTL_SECS) >= now
-                    && cache.local_root == local_appdata
-                    && cache.roaming_root == appdata;
+                    && cache.roots == roots;
                 (
                     cache
                         .entries
@@ -184,9 +182,9 @@ impl Scanner {
             };
 
         // 2. 并行处理
-        let sizes: Vec<(PathBuf, AppDataCategory, PathBuf, u64, u64)> = all_targets
+        let sizes: Vec<(PathBuf, String, String, PathBuf, u64, u64)> = all_targets
             .into_par_iter()
-            .map(|(path, category, parent)| {
+            .map(|(path, label, target_subdir, parent)| {
                 // 上报进度
                 let name = path
                     .file_name()
@@ -208,19 +206,19 @@ impl Scanner {
                 let finished = finished_count.fetch_add(1, Ordering::SeqCst) + 1;
                 progress_cb(finished, total_count, name);
 
-                (path, category, parent, size, current_mtime)
+                (path, label, target_subdir, parent, size, current_mtime)
             })
             .collect();
 
         // 3. 按父目录聚合计算 total_size 并筛选
         let mut parent_sizes = std::collections::HashMap::new();
-        for (_, _, parent, size, _) in &sizes {
+        for (_, _, _, parent, size, _) in &sizes {
             *parent_sizes.entry(parent.clone()).or_insert(0) += size;
         }
 
         let mut cache_entries: Vec<CacheEntry> = Vec::new();
 
-        for (path, category, parent, size, mtime) in sizes {
+        for (path, label, target_subdir, parent, size, mtime) in sizes {
             cache_entries.push(CacheEntry {
                 path: path.clone(),
                 size,
@@ -243,7 +241,8 @@ impl Scanner {
                         .to_string(),
                     path,
                     size_bytes: size,
-                    category,
+                    label,
+                    target_subdir,
                     parent_total_size: total_size,
                 });
             }
@@ -253,7 +252,7 @@ impl Scanner {
         results.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
         // Save new cache (cache all folders, not only top results)
-        Self::save_cache(&local_appdata, &appdata, cache_entries);
+        Self::save_cache(roots, cache_entries);
 
         Ok(results)
     }

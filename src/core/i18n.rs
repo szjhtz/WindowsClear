@@ -27,6 +27,8 @@ impl I18n {
         );
         en_map.insert("目标根目录:", "Target Root:");
         en_map.insert("选择...", "Browse...");
+        en_map.insert("扫描目录:", "Scan folders:");
+        en_map.insert("添加...", "Add...");
         en_map.insert(
             "自动结束占用进程 (慎用)",
             "Auto-kill locking processes (Use with caution)",

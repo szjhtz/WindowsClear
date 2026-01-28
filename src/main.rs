@@ -10,6 +10,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 
+use crate::core::config::AppConfig;
 use crate::core::i18n::{self, Language};
 use crate::core::logger;
 use crate::core::mover::Mover;
@@ -37,6 +38,7 @@ pub struct App {
     rx: std::sync::mpsc::Receiver<AppEvent>,
     tx: std::sync::mpsc::Sender<AppEvent>,
 
+    config: AppConfig,
     scan_results: Vec<ScanResult>,
     selected_items: std::collections::HashSet<usize>,
     completed_tasks: std::collections::HashSet<usize>, // New: Track completed tasks
@@ -83,15 +85,17 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_custom_fonts(&cc.egui_ctx);
 
+        let config = AppConfig::load_or_create().unwrap_or_else(|_| AppConfig::default_config());
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
             rx,
             tx,
+            config: config.clone(),
             scan_results: Vec::new(),
             selected_items: std::collections::HashSet::new(),
             completed_tasks: std::collections::HashSet::new(),
             is_scanning: false,
-            target_root: PathBuf::from("D:\\AppData"),
+            target_root: config.target_root.clone(),
             is_processing: false,
             is_paused: false,
             processing_type: ProcessingType::None,
@@ -116,6 +120,11 @@ impl App {
             parallelism: 6,
             lang: Language::Chinese,
         }
+    }
+
+    fn persist_config(&mut self) {
+        self.config.target_root = self.target_root.clone();
+        let _ = self.config.save();
     }
 
     fn format_bytes(bytes: u64) -> String {
@@ -351,6 +360,7 @@ impl eframe::App for App {
 
                     let tx = self.tx.clone();
                     let ctx = ctx.clone();
+                    let scan_sources = self.config.scan_sources.clone();
                     thread::spawn(move || {
                         let tx_clone = tx.clone();
                         let cb = move |current, total, name| {
@@ -358,7 +368,7 @@ impl eframe::App for App {
                             ctx.request_repaint();
                         };
 
-                        match Scanner::scan_large_folders(cb) {
+                        match Scanner::scan_large_folders(&scan_sources, cb) {
                             Ok(res) => {
                                 let _ = tx.send(AppEvent::ScanComplete(res));
                             }
@@ -434,20 +444,10 @@ impl eframe::App for App {
                             thread::spawn(move || {
                                 tx.send(AppEvent::MoveStart(total_bytes)).unwrap();
 
-                                let mut needs_local = false;
-                                let mut needs_roaming = false;
+                                let mut roots_to_check: std::collections::HashSet<PathBuf> =
+                                    std::collections::HashSet::new();
                                 for (_, task) in &tasks {
-                                    match task.category {
-                                        crate::core::scanner::AppDataCategory::Local => needs_local = true,
-                                        crate::core::scanner::AppDataCategory::Roaming => needs_roaming = true,
-                                    }
-                                }
-                                let mut roots_to_check = Vec::new();
-                                if needs_local {
-                                    roots_to_check.push(target_base.join("Local"));
-                                }
-                                if needs_roaming {
-                                    roots_to_check.push(target_base.join("Roaming"));
+                                    roots_to_check.insert(target_base.join(&task.target_subdir));
                                 }
                                 for root in roots_to_check {
                                     if root.exists() && !root.is_dir() {
@@ -476,14 +476,7 @@ impl eframe::App for App {
                                 }
 
                                 for (idx, task) in tasks {
-                                    let target_root = match task.category {
-                                        crate::core::scanner::AppDataCategory::Local => {
-                                            target_base.join("Local")
-                                        }
-                                        crate::core::scanner::AppDataCategory::Roaming => {
-                                            target_base.join("Roaming")
-                                        }
-                                    };
+                                    let target_root = target_base.join(&task.target_subdir);
 
                                     if auto_kill {
                                         if let Ok(pids) =
@@ -583,9 +576,52 @@ impl eframe::App for App {
                 {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.target_root = path;
+                        self.persist_config();
                     }
                 }
             });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(i18n::t("扫描目录:"));
+                if ui
+                    .add_enabled(!self.is_processing, egui::Button::new(i18n::t("添加...")))
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.config.add_custom_scan_dir(&path);
+                        let _ = self.config.save();
+                    }
+                }
+            });
+            let mut scan_sources_changed = false;
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    let mut remove_idx: Option<usize> = None;
+                    for (idx, s) in self.config.scan_sources.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut s.enabled, "").changed() {
+                                scan_sources_changed = true;
+                            }
+                            ui.label(&s.label);
+                            ui.weak(s.path.to_string_lossy());
+                            if ui
+                                .add_enabled(!self.is_processing, egui::Button::new("×"))
+                                .clicked()
+                            {
+                                remove_idx = Some(idx);
+                            }
+                        });
+                    }
+                    if let Some(idx) = remove_idx {
+                        self.config.scan_sources.remove(idx);
+                        scan_sources_changed = true;
+                    }
+                });
+            if scan_sources_changed {
+                let _ = self.config.save();
+            }
 
             ui.checkbox(&mut self.auto_kill, i18n::t("自动结束占用进程 (慎用)"));
             ui.horizontal(|ui| {
@@ -692,7 +728,7 @@ impl eframe::App for App {
                                 .arg(res.path.to_string_lossy().to_string())
                                 .spawn();
                         }
-                        ui.weak(format!("[{:?}]", res.category));
+                        ui.weak(format!("[{}]", res.label));
                         if ui.link(res.path.to_string_lossy().to_string()).clicked() {
                             let _ = std::process::Command::new("explorer")
                                 .arg(res.path.to_string_lossy().to_string())
