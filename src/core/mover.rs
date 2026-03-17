@@ -59,7 +59,7 @@ impl Mover {
         pause_signal: Arc<AtomicBool>,
         parallelism: usize,
         auto_kill: bool,
-    ) -> Result<()>
+    ) -> Result<u64>
     where
         F: Fn(u64) + Clone + Send + Sync + 'static,
     {
@@ -100,21 +100,23 @@ impl Mover {
                 parallelism,
             )
             .context("增量复制失败")?;
-            if let Err(e) = Self::place_junction_with_backup(source, &target_path, auto_kill) {
-                logger::log(&format!("root junction failed: {}", e));
-                let (ok, total) = Self::link_child_dirs(source, &target_path, auto_kill);
-                if ok > 0 {
-                    return Err(anyhow!(
-                        "根目录创建软链接失败（{}），但已对 {}/{} 个子目录创建软链接（见日志）",
-                        e,
-                        ok,
-                        total
-                    ));
+            match Self::place_junction_with_backup(source, &target_path, auto_kill) {
+                Ok(lb) => {
+                    logger::log(&format!("move_and_link done via incremental {:?}", source));
+                    return Ok(lb);
                 }
-                return Err(e);
+                Err(e) => {
+                    logger::log(&format!("root junction failed: {}", e));
+                    let (ok, total, _) = Self::link_child_dirs(source, &target_path, auto_kill);
+                    if ok > 0 {
+                        return Err(anyhow!(
+                            "根目录创建软链接失败（{}），但已对 {}/{} 个子目录创建软链接（见日志）",
+                            e, ok, total
+                        ));
+                    }
+                    return Err(e);
+                }
             }
-            logger::log(&format!("move_and_link done via incremental {:?}", source));
-            return Ok(());
         }
 
         if fs::rename(source, &target_path).is_ok() {
@@ -125,7 +127,7 @@ impl Mover {
                 anyhow!("创建链接失败: {}。已尝试恢复文件。", e)
             })?;
             logger::log(&format!("move_and_link done via rename {:?}", source));
-            return Ok(());
+            return Ok(0);
         }
         logger::log(&format!(
             "rename failed {:?} -> {:?}, fallback to staged copy",
@@ -151,30 +153,32 @@ impl Mover {
             target_partial, target_path
         ));
 
-        if let Err(e) = Self::place_junction_with_backup(source, &target_path, auto_kill) {
-            logger::log(&format!("root junction failed: {}", e));
-            let (ok, total) = Self::link_child_dirs(source, &target_path, auto_kill);
-            if ok > 0 {
-                return Err(anyhow!(
-                    "根目录创建软链接失败（{}），但已对 {}/{} 个子目录创建软链接（见日志）",
-                    e,
-                    ok,
-                    total
-                ));
+        match Self::place_junction_with_backup(source, &target_path, auto_kill) {
+            Ok(lb) => {
+                logger::log(&format!("move_and_link done via staged copy {:?}", source));
+                Ok(lb)
             }
-            return Err(e);
+            Err(e) => {
+                logger::log(&format!("root junction failed: {}", e));
+                let (ok, total, _) = Self::link_child_dirs(source, &target_path, auto_kill);
+                if ok > 0 {
+                    return Err(anyhow!(
+                        "根目录创建软链接失败（{}），但已对 {}/{} 个子目录创建软链接（见日志）",
+                        e, ok, total
+                    ));
+                }
+                Err(e)
+            }
         }
-
-        logger::log(&format!("move_and_link done via staged copy {:?}", source));
-        Ok(())
     }
 
-    fn link_child_dirs(source: &Path, target: &Path, auto_kill: bool) -> (usize, usize) {
+    fn link_child_dirs(source: &Path, target: &Path, auto_kill: bool) -> (usize, usize, u64) {
         let mut total = 0usize;
         let mut ok = 0usize;
+        let mut left_behind = 0u64;
 
         let Ok(entries) = fs::read_dir(source) else {
-            return (0, 0);
+            return (0, 0, 0);
         };
 
         for entry in entries.flatten() {
@@ -193,11 +197,12 @@ impl Mover {
                 continue;
             }
             match Self::place_junction_with_backup(&child, &target_child, auto_kill) {
-                Ok(_) => {
+                Ok(lb) => {
                     ok += 1;
+                    left_behind += lb;
                     logger::log(&format!(
-                        "child junction ok {:?} -> {:?}",
-                        child, target_child
+                        "child junction ok {:?} -> {:?} left_behind {}",
+                        child, target_child, lb
                     ));
                 }
                 Err(e) => {
@@ -206,7 +211,7 @@ impl Mover {
             }
         }
 
-        (ok, total)
+        (ok, total, left_behind)
     }
 
     fn copy_dir_all_auto<F>(
@@ -487,7 +492,7 @@ impl Mover {
         Ok(())
     }
 
-    fn place_junction_with_backup(source: &Path, target: &Path, auto_kill: bool) -> Result<()> {
+    fn place_junction_with_backup(source: &Path, target: &Path, auto_kill: bool) -> Result<u64> {
         let name = source
             .file_name()
             .ok_or_else(|| anyhow!("无效的源路径"))?
@@ -522,7 +527,7 @@ impl Mover {
                 ));
                 let _ = fs::remove_dir(source);
                 let _ = fs::remove_file(source);
-                return Self::create_junction(source, target).context("创建链接失败");
+                return Self::create_junction(source, target).context("创建链接失败").map(|_| 0);
             }
         }
 
@@ -667,12 +672,14 @@ impl Mover {
         match Self::create_junction(source, target) {
             Ok(_) => {
                 logger::log(&format!("junction created {:?} -> {:?}", source, target));
+                let mut lb = 0;
                 if let Err(e) = fs::remove_dir_all(&backup) {
                     logger::log(&format!("remove backup failed {:?}: {}", backup, e));
+                    lb = crate::core::scanner::Scanner::get_dir_size(&backup);
                 } else {
                     logger::log(&format!("remove backup ok {:?}", backup));
                 }
-                Ok(())
+                Ok(lb)
             }
             Err(e) => {
                 logger::log(&format!("junction create failed: {}", e));

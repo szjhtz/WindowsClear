@@ -29,7 +29,7 @@ enum AppEvent {
     // Move events
     MoveStart(u64),          // Total bytes to move
     MoveProgressBytes(u64),  // Bytes moved in this chunk (incremental)
-    MoveTaskComplete(usize), // Index of task completed
+    MoveTaskComplete(usize, u64), // Index of task completed, left behind bytes
     MoveComplete,
     MoveError(String),
 }
@@ -71,6 +71,7 @@ pub struct App {
     // Move Progress
     move_total_bytes: u64,
     move_current_bytes: u64,
+    move_actual_freed_bytes: u64,
     move_start_time: Option<Instant>,
     move_speed_bps: f64,
     move_remaining_secs: u64,
@@ -122,6 +123,7 @@ impl App {
 
             move_total_bytes: 0,
             move_current_bytes: 0,
+            move_actual_freed_bytes: 0,
             move_start_time: None,
             move_speed_bps: 0.0,
             move_remaining_secs: 0,
@@ -276,6 +278,7 @@ impl eframe::App for App {
                 AppEvent::MoveStart(total_bytes) => {
                     self.move_total_bytes = total_bytes;
                     self.move_current_bytes = 0;
+                    self.move_actual_freed_bytes = 0;
                     self.move_start_time = Some(Instant::now());
                     self.is_paused = false;
                     self.pause_signal.store(false, Ordering::SeqCst);
@@ -317,8 +320,11 @@ impl eframe::App for App {
                         }
                     }
                 }
-                AppEvent::MoveTaskComplete(idx) => {
+                AppEvent::MoveTaskComplete(idx, left_behind) => {
                     self.completed_tasks.insert(idx);
+                    if let Some(res) = self.scan_results.get(idx) {
+                        self.move_actual_freed_bytes += res.size_bytes.saturating_sub(left_behind);
+                    }
                 }
                 AppEvent::MoveComplete => {
                     self.is_processing = false;
@@ -326,27 +332,20 @@ impl eframe::App for App {
                     self.is_paused = false;
 
                     let mut moved_folders = Vec::new();
-                    let mut selected_total_size = 0u64;
                     for idx in &self.current_move_indices {
                         if let Some(res) = self.scan_results.get(*idx) {
                             moved_folders.push(res.path.to_string_lossy().to_string());
-                            selected_total_size += res.size_bytes;
                         }
                     }
                     let duration = self
                         .move_start_time
                         .map(|t| t.elapsed())
                         .unwrap_or_default();
-                    let transferred = self.move_current_bytes;
-                    let freed_space = if transferred > 0 {
-                        transferred
-                    } else {
-                        selected_total_size
-                    };
+                    
                     self.completion_stats = Some(CompletionStats {
                         moved_folders,
                         moved_count: self.current_move_indices.len(),
-                        freed_space,
+                        freed_space: self.move_actual_freed_bytes,
                         duration,
                     });
                     self.show_completion_dialog = true;
@@ -564,8 +563,8 @@ impl eframe::App for App {
                                         parallelism,
                                         auto_kill,
                                     ) {
-                                        Ok(_) => {
-                                            tx.send(AppEvent::MoveTaskComplete(idx)).unwrap();
+                                        Ok(lb) => {
+                                            tx.send(AppEvent::MoveTaskComplete(idx, lb)).unwrap();
                                         }
                                         Err(e) => {
                                             tx.send(AppEvent::MoveError(format!(
