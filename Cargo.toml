@@ -17,6 +17,7 @@ serde_json = "1.0"
 rfd = "0.14" # Rust File Dialog
 chrono = "0.4" # For caching timestamps
 filetime = "0.2.27"
+uuid = { version = "1.22.0", features = ["v4"] }
 
 # 优化发布构建体积和速度
 [profile.release]

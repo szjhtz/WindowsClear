@@ -13,6 +13,8 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::core::history::{HistoryManager, MigrationRecord};
+
 pub struct Mover;
 
 impl Mover {
@@ -59,7 +61,9 @@ impl Mover {
         pause_signal: Arc<AtomicBool>,
         parallelism: usize,
         auto_kill: bool,
-    ) -> Result<u64>
+        batch_id: String,
+        batch_timestamp: u64,
+    ) -> Result<(u64, MigrationRecord)>
     where
         F: Fn(u64) + Clone + Send + Sync + 'static,
     {
@@ -103,7 +107,20 @@ impl Mover {
             match Self::place_junction_with_backup(source, &target_path, auto_kill) {
                 Ok(lb) => {
                     logger::log(&format!("move_and_link done via incremental {:?}", source));
-                    return Ok(lb);
+                    
+                    let record = MigrationRecord {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: folder_name.to_string_lossy().to_string(),
+                        source_path: source.to_path_buf(),
+                        target_path: target_path.clone(),
+                        size_bytes: crate::core::scanner::Scanner::get_dir_size(&target_path),
+                        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                        batch_id: Some(batch_id.clone()),
+                        batch_timestamp: Some(batch_timestamp),
+                    };
+                    HistoryManager::add_record(record.clone());
+                    
+                    return Ok((lb, record));
                 }
                 Err(e) => {
                     logger::log(&format!("root junction failed: {}", e));
@@ -127,7 +144,20 @@ impl Mover {
                 anyhow!("创建链接失败: {}。已尝试恢复文件。", e)
             })?;
             logger::log(&format!("move_and_link done via rename {:?}", source));
-            return Ok(0);
+            
+            let record = MigrationRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: folder_name.to_string_lossy().to_string(),
+                source_path: source.to_path_buf(),
+                target_path: target_path.clone(),
+                size_bytes: crate::core::scanner::Scanner::get_dir_size(&target_path),
+                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                batch_id: Some(batch_id.clone()),
+                batch_timestamp: Some(batch_timestamp),
+            };
+            HistoryManager::add_record(record.clone());
+            
+            return Ok((0, record));
         }
         logger::log(&format!(
             "rename failed {:?} -> {:?}, fallback to staged copy",
@@ -156,7 +186,20 @@ impl Mover {
         match Self::place_junction_with_backup(source, &target_path, auto_kill) {
             Ok(lb) => {
                 logger::log(&format!("move_and_link done via staged copy {:?}", source));
-                Ok(lb)
+                
+                let record = MigrationRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: folder_name.to_string_lossy().to_string(),
+                    source_path: source.to_path_buf(),
+                    target_path: target_path.clone(),
+                    size_bytes: crate::core::scanner::Scanner::get_dir_size(&target_path),
+                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    batch_id: Some(batch_id.clone()),
+                    batch_timestamp: Some(batch_timestamp),
+                };
+                HistoryManager::add_record(record.clone());
+                
+                Ok((lb, record))
             }
             Err(e) => {
                 logger::log(&format!("root junction failed: {}", e));
@@ -749,6 +792,89 @@ impl Mover {
             let err_msg = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("mklink 失败: {}", err_msg));
         }
+        Ok(())
+    }
+
+    pub fn restore_migration<F>(
+        record: &MigrationRecord,
+        progress_cb: F,
+        pause_signal: Arc<AtomicBool>,
+        parallelism: usize,
+        auto_kill: bool,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Clone + Send + Sync + 'static,
+    {
+        logger::log(&format!("restore_migration start for {:?}", record.source_path));
+        
+        let source = &record.source_path;
+        let target = &record.target_path;
+
+        if !target.exists() {
+            return Err(anyhow!("移动目标文件 {} 已经不存在，无法自动还原。建议直接移除失效快捷方式", target.display()));
+        }
+
+        if auto_kill {
+            if let Ok(pids) = ProcMgr::check_locking_processes_dir(source) {
+                for pid in pids {
+                    let _ = ProcMgr::kill_process(pid);
+                }
+            }
+        }
+
+        // 1. Remove junction
+        if source.exists() {
+            if fs::symlink_metadata(source).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                // Remove junction carefully
+                if let Err(e) = fs::remove_dir(source).or_else(|_| fs::remove_file(source)) {
+                    return Err(anyhow!("解除原来的连接失败: {}", e));
+                }
+            } else if source.is_dir() {
+                 return Err(anyhow!("还原位置 {} 已包含非链接目录，为保护数据取消还原。请先手动清理", source.display()));
+            }
+        }
+
+        // Make sure source parent exists
+        if let Some(parent) = source.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).context("无法创建原路径父目录")?;
+            }
+        }
+
+        // 2. Move files back
+        if fs::rename(target, source).is_ok() {
+            logger::log(&format!("Restore rename success {:?} -> {:?}", target, source));
+            HistoryManager::remove_record(&record.id);
+            return Ok(());
+        }
+
+        logger::log(&format!("Restore rename failed {:?} -> {:?}, fallback to copy", target, source));
+
+        let partial_restore = source.with_extension("partial_restore");
+        if partial_restore.exists() {
+             let _ = fs::remove_dir_all(&partial_restore);
+        }
+        
+        fs::create_dir_all(&partial_restore).context("无法创建临时还原目录")?;
+        
+        if let Err(e) = Self::copy_dir_all_auto(target, &partial_restore, progress_cb, pause_signal, parallelism) {
+            logger::log(&format!("Restore copy failed: {}", e));
+            let _ = fs::remove_dir_all(&partial_restore);
+            return Err(e.context("文件复制回原路径失败"));
+        }
+
+        if let Err(e) = fs::rename(&partial_restore, source) {
+            return Err(anyhow::Error::new(e).context("整理被还原的目录失败"));
+        }
+
+        logger::log(&format!("Restore manual copy ok {:?} -> {:?}", target, source));
+        
+        if let Err(e) = fs::remove_dir_all(target) {
+            logger::log(&format!("Failed to clean up target after restore {:?}: {}", target, e));
+            // Don't fail the whole restore if cleanup fails, the data is back in the correct spot
+        }
+
+        HistoryManager::remove_record(&record.id);
         Ok(())
     }
 }

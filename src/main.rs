@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
@@ -16,6 +16,7 @@ use crate::core::logger;
 use crate::core::mover::Mover;
 use crate::core::proc_mgr::ProcMgr;
 use crate::core::scanner::{ScanResult, Scanner};
+use crate::core::history::{HistoryManager, MigrationRecord};
 
 mod core;
 
@@ -32,6 +33,12 @@ enum AppEvent {
     MoveTaskComplete(usize, u64), // Index of task completed, left behind bytes
     MoveComplete,
     MoveError(String),
+
+    // Restore events
+    RestoreStart(Vec<MigrationRecord>), // Batch being restored
+    RestoreProgressBytes(u64),          // Bytes restored in this chunk
+    RestoreComplete,                    // Restore finished
+    RestoreError(String),
 }
 
 struct CompletionStats {
@@ -39,6 +46,12 @@ struct CompletionStats {
     moved_count: usize,
     freed_space: u64,
     duration: Duration,
+}
+
+#[derive(PartialEq)]
+enum Tab {
+    ScanAndMove,
+    History,
 }
 
 pub struct App {
@@ -51,6 +64,9 @@ pub struct App {
     completed_tasks: std::collections::HashSet<usize>, // New: Track completed tasks
     current_move_indices: Vec<usize>,
     is_scanning: bool,
+
+    current_tab: Tab,
+    history_records: Vec<MigrationRecord>,
 
     target_root: PathBuf,
 
@@ -91,6 +107,7 @@ enum ProcessingType {
     None,
     Scanning,
     Moving,
+    Restoring,
 }
 
 impl App {
@@ -108,6 +125,8 @@ impl App {
             completed_tasks: std::collections::HashSet::new(),
             current_move_indices: Vec::new(),
             is_scanning: false,
+            current_tab: Tab::ScanAndMove,
+            history_records: HistoryManager::load_records(),
             target_root: config.target_root.clone(),
             is_processing: false,
             is_paused: false,
@@ -175,6 +194,123 @@ impl App {
             self.is_paused = !self.is_paused;
             self.pause_signal.store(self.is_paused, Ordering::SeqCst);
         }
+    }
+
+    fn show_history_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        if self.history_records.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(i18n::t("暂无迁移记录"));
+            });
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let mut restore_batch: Option<Vec<MigrationRecord>> = None;
+            let mut delete_record_id: Option<String> = None;
+
+            // Group by batch_id
+            let mut groups: std::collections::BTreeMap<String, Vec<MigrationRecord>> = std::collections::BTreeMap::new();
+            for r in &self.history_records {
+                let key = r.batch_id.clone().unwrap_or_else(|| r.id.clone());
+                groups.entry(key).or_default().push(r.clone());
+            }
+
+            // Sort groups by time (descending)
+            let mut sorted_groups: Vec<(String, Vec<MigrationRecord>)> = groups.into_iter().collect();
+            sorted_groups.sort_by(|a, b| {
+                let t_a = a.1.first().map(|r| r.timestamp).unwrap_or(0);
+                let t_b = b.1.first().map(|r| r.timestamp).unwrap_or(0);
+                t_b.cmp(&t_a) // Newest first
+            });
+
+            for (_batch_key, records) in sorted_groups {
+                ui.group(|ui| {
+                    let total_size: u64 = records.iter().map(|r| r.size_bytes).sum();
+                    let first_r = records.first().unwrap();
+                    let timestamp = first_r.batch_timestamp.unwrap_or(first_r.timestamp);
+                    let time = UNIX_EPOCH + Duration::from_secs(timestamp);
+                    let datetime: chrono::DateTime<chrono::Local> = time.into();
+
+                    ui.horizontal(|ui| {
+                        if records.len() > 1 {
+                            ui.heading(format!("{} ({} 项)", i18n::t("多个迁移批次"), records.len()));
+                        } else {
+                            ui.heading(&first_r.name);
+                        }
+                        ui.label(format!("({})", Self::format_bytes(total_size)));
+                        ui.label(datetime.format("%Y-%m-%d %H:%M:%S").to_string());
+                        
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add_enabled(!self.is_processing, egui::Button::new(i18n::t("一键还原本批次"))).clicked() {
+                                restore_batch = Some(records.clone());
+                            }
+                        });
+                    });
+
+                    for record in &records {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("📁 {}", record.name));
+                            ui.label(format!("{} {:?}", i18n::t("从:"), record.source_path));
+                            ui.label(format!("{} {:?}", i18n::t("到:"), record.target_path));
+                            if ui.add_enabled(!self.is_processing, egui::Button::new(i18n::t("清除记录"))).on_hover_text(i18n::t("强制从列表中移除该记录（不还原文件）")).clicked() {
+                                delete_record_id = Some(record.id.clone());
+                            }
+                        });
+                    }
+                });
+            }
+
+            if let Some(id) = delete_record_id {
+                HistoryManager::remove_record(&id);
+                self.history_records = HistoryManager::load_records();
+            }
+
+            if let Some(batch) = restore_batch {
+                self.start_restore_batch(batch, ctx);
+            }
+        });
+    }
+
+    fn start_restore_batch(&mut self, batch: Vec<MigrationRecord>, ctx: &egui::Context) {
+        self.is_processing = true;
+        self.processing_type = ProcessingType::Restoring;
+        self.is_paused = false;
+        self.pause_signal.store(false, Ordering::SeqCst);
+        
+        let tx = self.tx.clone();
+        let ctx_clone = ctx.clone();
+        let ctx_final_clone = ctx.clone();
+        let pause_signal = self.pause_signal.clone();
+        let parallelism = if self.parallel_copy { self.parallelism.max(1) } else { 1 };
+        let auto_kill = self.auto_kill;
+
+        thread::spawn(move || {
+            tx.send(AppEvent::RestoreStart(batch.clone())).unwrap();
+            
+            for record in batch {
+                let tx_clone = tx.clone();
+                let ctx_inner = ctx_clone.clone();
+                let progress_cb = move |bytes_delta| {
+                    let _ = tx_clone.send(AppEvent::RestoreProgressBytes(bytes_delta));
+                    ctx_inner.request_repaint();
+                };
+
+                while pause_signal.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+
+                match Mover::restore_migration(&record, progress_cb, pause_signal.clone(), parallelism, auto_kill) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tx.send(AppEvent::RestoreError(format!("未能还原全部分支，因为 {} 失败: {}", record.name, e))).unwrap();
+                        ctx_final_clone.request_repaint();
+                        return;
+                    }
+                }
+            }
+            tx.send(AppEvent::RestoreComplete).unwrap();
+            ctx_final_clone.request_repaint();
+        });
     }
 }
 
@@ -331,6 +467,9 @@ impl eframe::App for App {
                     self.processing_type = ProcessingType::None;
                     self.is_paused = false;
 
+                    // Reload history manually so ui updates
+                    self.history_records = HistoryManager::load_records();
+
                     let mut moved_folders = Vec::new();
                     for idx in &self.current_move_indices {
                         if let Some(res) = self.scan_results.get(*idx) {
@@ -374,15 +513,87 @@ impl eframe::App for App {
                     logger::log(&format!("move error: {}", e));
                     self.status_msg = format!("{}: {}", i18n::t("错误: {}").replace("{}", ""), e);
                 }
+
+                // --- RESTORE EVENTS ---
+                AppEvent::RestoreStart(batch) => {
+                    self.move_current_bytes = 0;
+                    self.move_total_bytes = batch.iter().map(|r| r.size_bytes).sum();
+                    self.move_start_time = Some(Instant::now());
+                    self.is_paused = false;
+                    self.pause_signal.store(false, Ordering::SeqCst);
+                    self.last_error.clear();
+                    self.move_error_count = 0;
+                    self.move_speed_bps = 0.0;
+                    self.move_remaining_secs = 0;
+
+                    if self.lang == Language::English {
+                        self.status_msg = "Restoring...".to_string();
+                    } else {
+                        self.status_msg = "正在还原...".to_string();
+                    }
+                }
+                AppEvent::RestoreProgressBytes(bytes_delta) => {
+                    self.move_current_bytes += bytes_delta;
+
+                    // Calculate speed & ETA
+                    if let Some(start_time) = self.move_start_time {
+                        if !self.is_paused {
+                            let elapsed = start_time.elapsed().as_secs_f64();
+                            if elapsed > 0.5 {
+                                self.move_speed_bps = self.move_current_bytes as f64 / elapsed;
+                                if self.move_speed_bps > 0.0 {
+                                    let remaining_bytes = self
+                                        .move_total_bytes
+                                        .saturating_sub(self.move_current_bytes);
+                                    self.move_remaining_secs =
+                                        (remaining_bytes as f64 / self.move_speed_bps) as u64;
+                                }
+                            }
+                        }
+                    }
+                }
+                AppEvent::RestoreComplete => {
+                    self.is_processing = false;
+                    self.processing_type = ProcessingType::None;
+                    self.is_paused = false;
+
+                    // Reload history
+                    self.history_records = HistoryManager::load_records();
+                    
+                    if self.lang == Language::English {
+                        self.status_msg = "Restore completed successfully.".to_string();
+                    } else {
+                        self.status_msg = "批次还原成功。".to_string();
+                    }
+                }
+                AppEvent::RestoreError(e) => {
+                    self.is_processing = false;
+                    self.processing_type = ProcessingType::None;
+                    self.is_paused = false;
+                    self.last_error = e.clone();
+                    logger::log(&format!("restore error: {}", e));
+                    self.status_msg = format!("{}: {}", i18n::t("还原失败: {}").replace("{}", ""), e);
+                }
             }
         }
 
-        // Force repaint if moving to update animation/progress bar smoothly
-        if self.processing_type == ProcessingType::Moving {
+        // Force repaint if moving or restoring to update animation/progress bar smoothly
+        if self.processing_type == ProcessingType::Moving || self.processing_type == ProcessingType::Restoring {
             ctx.request_repaint();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.current_tab, Tab::ScanAndMove, i18n::t("扫描与迁移"));
+                ui.selectable_value(&mut self.current_tab, Tab::History, i18n::t("迁移记录"));
+            });
+            ui.separator();
+
+            if self.current_tab == Tab::History {
+                self.show_history_tab(ctx, ui);
+                return;
+            }
+
             ui.horizontal(|ui| {
                 let btn_size = egui::vec2(130.0, 36.0);
                 let txt_size = 18.0;
@@ -496,6 +707,8 @@ impl eframe::App for App {
 
                             // Calculate total size first
                             let total_bytes: u64 = tasks.iter().map(|(_, t)| t.size_bytes).sum();
+                            let batch_id = uuid::Uuid::new_v4().to_string();
+                            let batch_timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
                             thread::spawn(move || {
                                 tx.send(AppEvent::MoveStart(total_bytes)).unwrap();
@@ -562,8 +775,10 @@ impl eframe::App for App {
                                         pause_signal.clone(),
                                         parallelism,
                                         auto_kill,
+                                        batch_id.clone(),
+                                        batch_timestamp,
                                     ) {
-                                        Ok(lb) => {
+                                        Ok((lb, _record)) => {
                                             tx.send(AppEvent::MoveTaskComplete(idx, lb)).unwrap();
                                         }
                                         Err(e) => {
