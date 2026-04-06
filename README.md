@@ -1,6 +1,10 @@
 # WindowsClear (愚公移盘)
 <img width="791" height="487" alt="img1" src="https://github.com/user-attachments/assets/6c10a5cd-d111-44a2-b355-dba91108de88" />
-
+<table>
+<tr>
+<td>感谢 MuskAPI 赞助了本项目！MuskAPI 是一个集成了 Claude Code、Codex 最新模型的一站式平台，为你提供稳定、高效且高性价比的AI编程服务。本站提供灵活的订阅计划，零封号风险，国内直连，无需魔法，极速响应。通过<a href="https://muskapi.com">此链接</a>注册！</td>
+</tr>
+</table>
 <p align="center">
    
 <p align="center">
